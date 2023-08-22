@@ -71,7 +71,13 @@ class ParseDType(Action):
 
 def parse_args():
     parser = ArgumentParser(description="PyTorch Data Parallel Experiments")
-
+    
+    parser.add_argument(
+        "--machine",
+        type=str,
+        default="Summit",
+        help="Summit, Crusher, Frontier",
+    )
     parser.add_argument(
         "--model",
         type=str,
@@ -241,9 +247,9 @@ def build_fsdp_model(args):
 
     backward_prefetch = None
     if args.prefetch == "prehook":
-        backward_prefetch = BackwardPrefetch_.BACKWARD_PRE
+        backward_prefetch = BackwardPrefetch.BACKWARD_PRE
     elif args.prefetch == "posthook":
-        backward_prefetch = BackwardPrefetch_.BACKWARD_POST
+        backward_prefetch = BackwardPrefetch.BACKWARD_POST
 
     if args.model.startswith("GPT"):
         # still needs to call to(device) because GPT buffer is still on CPU
@@ -391,11 +397,11 @@ def train(args):
     else:
         raise ValueError("Inputs not implemented for non-GPT models")
 
-    opt = torch.optim.SGD(model.parameters(), lr=0.01)
+    opt = torch.optim.Adam(model.parameters(), lr=0.01)
     print_memory_summary("After optimizer", "cuda:0")
 
     # warmup
-    for i in range(4):
+    for i in range(5):
         out = model(inputs)
         print_memory_summary(f"Step {i} After forward", "cuda:0")
         loss = out.sum() if isinstance(out, torch.Tensor) else out.local_value().sum()
@@ -408,7 +414,6 @@ def train(args):
         print_memory_summary(f"Step {i} After optimizer", "cuda:0")
         opt.zero_grad()
         print_memory_summary(f"Step {i} After zero grad", "cuda:0")
-
     # make sure all pending warm up ops are done
     sync_all_device()
     dist.barrier()
@@ -480,6 +485,7 @@ def train(args):
 
     if rank == 0:
         name = (
+            f"{args.machine}_"
             f"{args.mode}_{args.model}_"
             f"ws{ws}_bs{args.batch_size}_"
             f"vs{args.vocab_size}_blk{args.block_size}_"

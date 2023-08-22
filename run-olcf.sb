@@ -1,0 +1,45 @@
+#!/bin/bash -l
+#SBATCH -J fsdp
+#SBATCH -t 1:00:00
+#SBATCH -N 1
+#SBATCH -A stf218
+#SBATCH --exclusive 
+#SBATCH --ntasks-per-node=8
+#SBATCH -o fsdp.o%j
+
+# env
+source env.sh
+
+MODEL=GPTXL
+MODE=fsdp
+BS=8
+DTYPE=fp16
+VOCAB=50000
+SEQ=2048
+ACTIVATION=checkpoint
+PREFETCH=prehook
+SYS=Frontier
+
+
+CMD="python -u trainer_mix.py --model ${MODEL} \
+                             --mode ${MODE}\
+                             --dtype ${DTYPE}\
+                             --batch_size ${BS}\
+                             --vocab_size ${VOCAB}\
+                             --block_size ${SEQ}\
+                             --activation ${ACTIVATION}\
+                             --prefetch ${PREFETCH}\
+                             --machine ${SYS}\
+"
+
+echo $CMD
+
+NUM_RANKS=`expr ${SLURM_NNODES} \* ${SLURM_NTASKS_PER_NODE}`
+NUM_RANKS_PER_NODE=${SLURM_NTASKS_PER_NODE}
+
+
+HOME=/tmp srun --nodes=${SLURM_NNODES} --ntasks=${NUM_RANKS} --ntasks-per-node=${NUM_RANKS_PER_NODE} --cpu_bind=none bash -c "\
+    source setup_fsdp.sh && $CMD \
+    "
+
+
