@@ -25,8 +25,9 @@ from models import (
     GPT1T,
     ShardedGPT,
     sequential_gpt,
+    Block
 )
-
+import functools 
 import torch
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel
@@ -37,8 +38,18 @@ from torch.profiler import (
     ProfilerActivity,
     tensorboard_trace_handler,
 )
-from torch.distributed.fsdp.wrap import enable_wrap, wrap
+from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
+    checkpoint_wrapper,
+    CheckpointImpl,
+    apply_activation_checkpointing,
+)
+from torch.distributed._tensor import (
+    DeviceMesh,
+)
+
+from torch.distributed.fsdp.wrap import enable_wrap, wrap, transformer_auto_wrap_policy
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP, CPUOffload
+from torch.distributed.fsdp import ShardingStrategy
 from torch.distributed.fsdp.fully_sharded_data_parallel import BackwardPrefetch
 
 # from fairscale.nn.data_parallel import FullyShardedDataParallel as fairscale_fsdp
@@ -78,6 +89,19 @@ def parse_args():
         default="Summit",
         help="Summit, Crusher, Frontier",
     )
+    parser.add_argument(
+        "--sharding_strategy",
+        type=str,
+        default="hybrid",
+        help="hybrid, full",
+    )    
+    parser.add_argument(
+        "--mp_size",
+        type=int,
+        default=8,
+        help="model parallel size",
+    )
+ 
     parser.add_argument(
         "--model",
         type=str,
@@ -184,6 +208,12 @@ def print_memory_summary(prefix, device):
         )
         torch.cuda.reset_peak_memory_stats(device)
 
+def print_process_group(pg):
+    rank = int(os.getenv("RANK"))
+    if rank == 0:
+        size = pg.size()
+        ranks = torch.distributed.get_process_group_ranks(pg)
+        print(f"process group of {size}:{ranks}")
 
 def get_gpt_config(args):
     assert args.model.startswith("GPT")
@@ -193,6 +223,68 @@ def get_gpt_config(args):
     assert config_class_name in globals()
     return globals()[config_class_name](args.vocab_size, args.block_size)
 
+def get_wrap_policy(block):
+    wrap_policy = functools.partial(
+                 transformer_auto_wrap_policy,
+                 transformer_layer_cls=block
+               )
+    return wrap_policy
+
+def get_sharding_strategy(args):
+    if args.sharding_strategy == "FULL":
+        sharding_strategy = ShardingStrategy.FULL_SHARD
+    else:
+        sharding_strategy = ShardingStrategy.HYBRID_SHARD
+    return sharding_strategy 
+  
+def get_process_group(args):
+    world_size = int(os.getenv("WORLD_SIZE"))
+    mp_size = args.mp_size
+    dp_size = world_size // mp_size
+    assert  mp_size * dp_size == world_size
+    pg = DeviceMesh(
+              device_type = "cuda",
+              mesh = torch.arange(0, world_size).view(dp_size,-1) 
+             )
+    return pg
+
+def fsdp_checkpointing(model, blocks):
+    """apply activation checkpointing to model
+    returns None as model is updated directly
+    """
+
+    non_reentrant_wrapper = functools.partial(
+        checkpoint_wrapper,
+        # offload_to_cpu=False,
+        checkpoint_impl=CheckpointImpl.NO_REENTRANT,
+    )
+
+    def selective_checkpointing(submodule, every_xth_item: int = 0):
+        """enables selective checkpointing of candidate layers.
+        Usage:
+        every_xth_item controls which items to checkpoint.
+        None, 0 == checkpointing filtering not active, checkpoint all instances
+        1 == checkpointing every one (all).
+        2 == checkpoint every 2nd one
+        3 == checkpoint every 3rd one
+        4 = checkpoint every 4th one, etc.
+        """
+        selective_checkpointing.__dict__.setdefault("_count", 0)
+
+        if isinstance(submodule, blocks):
+            selective_checkpointing._count += 1
+            if (
+                not every_xth_item
+                or selective_checkpointing._count % every_xth_item == 0
+            ):
+                return True
+        return False
+
+    return apply_activation_checkpointing(
+        model,
+        checkpoint_wrapper_fn=non_reentrant_wrapper,
+        check_fn=selective_checkpointing,
+    )
 
 def build_ddp_model(args):
     # since we have set CUDA_VISIBLE_DEVICES, each process only sees one device,
@@ -235,6 +327,42 @@ def build_pdp_model(args):
 
 
 def build_fsdp_model(args):
+    rank = int(os.getenv("RANK"))
+    #device_id = int(os.getenv("LOCAL_RANK"))
+    #device = torch.device(f"cuda:{device_id}")
+    device = torch.device("cuda")
+    cpu_offload_config = None
+    if args.cpu_offload:
+        if rank == 0:
+            print("Enabling cpu offloading")
+        cpu_offload_config = CPUOffload(offload_params=True)
+
+    backward_prefetch = None
+    if args.prefetch == "prehook":
+        backward_prefetch = BackwardPrefetch.BACKWARD_PRE
+    elif args.prefetch == "posthook":
+        backward_prefetch = BackwardPrefetch.BACKWARD_POST
+
+    pg_dp, pg_mp = get_process_group(args).get_dim_groups()[0], get_process_group(args).get_dim_groups()[1]
+                       
+    print_process_group(pg_mp)
+    print_process_group(pg_dp)
+
+    gpt = GPT(get_gpt_config(args), device=device, dtype=args.dtype)
+    shardgpt = FSDP( 
+               gpt,
+               process_group = (pg_mp, pg_dp),
+               auto_wrap_policy = get_wrap_policy({Block}),
+               backward_prefetch= backward_prefetch,
+               sharding_strategy= get_sharding_strategy(args),#ShardingStrategy.HYBRID_SHARD,
+               cpu_offload=cpu_offload_config,
+               device_id=torch.cuda.current_device()
+               )
+    if args.activation:
+        fsdp_checkpointing(shardgpt, Block)
+    return shardgpt
+
+def build_manualwrap_fsdp_model(args):
     rank = int(os.getenv("RANK"))
 
     device = torch.device("cuda:0")
