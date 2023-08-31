@@ -17,12 +17,16 @@ DTYPE=fp16
 VOCAB=50000
 SEQ=2048
 ACTIVATION=checkpoint
+STRATEGY=hybird
+MP=2
 PREFETCH=prehook
 SYS=Frontier
 
 
 CMD="python -u trainer_mix.py --model ${MODEL} \
                              --mode ${MODE}\
+                             --sharding_strategy ${STRATEGY}\
+                             --mp_size ${MP}\
                              --dtype ${DTYPE}\
                              --batch_size ${BS}\
                              --vocab_size ${VOCAB}\
@@ -38,7 +42,7 @@ NUM_RANKS=`expr ${SLURM_NNODES} \* ${SLURM_NTASKS_PER_NODE}`
 NUM_RANKS_PER_NODE=${SLURM_NTASKS_PER_NODE}
 
 
-HOME=/tmp srun --nodes=${SLURM_NNODES} --ntasks=${NUM_RANKS} --ntasks-per-node=${NUM_RANKS_PER_NODE} --cpu_bind=none bash -c "\
+HOME=/tmp srun --nodes=${SLURM_NNODES} --ntasks=${NUM_RANKS} --ntasks-per-node=${NUM_RANKS_PER_NODE} -c7 --gpus-per-node=8 bash -c "\
     source setup_fsdp.sh && $CMD \
     "
 

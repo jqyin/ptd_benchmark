@@ -242,11 +242,22 @@ def get_process_group(args):
     mp_size = args.mp_size
     dp_size = world_size // mp_size
     assert  mp_size * dp_size == world_size
-    pg = DeviceMesh(
+    #pg = DeviceMesh(
+    #          device_type = "cuda",
+    #          mesh = torch.arange(0, world_size).view(dp_size,-1) 
+    #         )
+    mesh_list = []
+    dmesh = torch.arange(0, world_size).view(-1, mp_size)
+    for i, sg in enumerate(dmesh):
+        mesh_list.append(sg.tolist())
+
+    mesh = DeviceMesh( 
               device_type = "cuda",
-              mesh = torch.arange(0, world_size).view(dp_size,-1) 
-             )
-    return pg
+              mesh=mesh_list
+           )
+    mesh_groups = mesh.get_dim_groups()
+    pg_dp, pg_mp = mesh_groups[0], mesh_groups[1] 
+    return pg_dp, pg_mp
 
 def fsdp_checkpointing(model, blocks):
     """apply activation checkpointing to model
@@ -343,7 +354,7 @@ def build_fsdp_model(args):
     elif args.prefetch == "posthook":
         backward_prefetch = BackwardPrefetch.BACKWARD_POST
 
-    pg_dp, pg_mp = get_process_group(args).get_dim_groups()[0], get_process_group(args).get_dim_groups()[1]
+    pg_dp, pg_mp = get_process_group(args)
                        
     print_process_group(pg_mp)
     print_process_group(pg_dp)
@@ -356,9 +367,10 @@ def build_fsdp_model(args):
                backward_prefetch= backward_prefetch,
                sharding_strategy= get_sharding_strategy(args),#ShardingStrategy.HYBRID_SHARD,
                cpu_offload=cpu_offload_config,
-               device_id=torch.cuda.current_device()
+               device_id=torch.cuda.current_device(),
+               use_orig_params=True,
                )
-    if args.activation:
+    if args.activation == "checkpoint":
         fsdp_checkpointing(shardgpt, Block)
     return shardgpt
 
@@ -504,6 +516,8 @@ def train(args):
             model = build_pdp_model(args)
         elif args.mode == "fsdp":
             model = build_fsdp_model(args)
+        elif args.mode == "fsdp-manual":
+            model = build_manualwrap_fsdp_model(args)
 
     init_end_event.record()
     sync_all_device()
@@ -651,7 +665,7 @@ def train(args):
 
 
 def setup(args):
-    if args.mode in ["ddp", "fsdp"]:
+    if args.mode in ["ddp", "fsdp", "fsdp-manual"]:
         local_rank = os.getenv("LOCAL_RANK")
         # set the visible devices so that each DDP process only sees one CUDA device
         # N.B.: this has to be done before using any CUDA API from torch
@@ -676,6 +690,7 @@ def setup(args):
         print(f"parsed args {args}")
         print(f"World size is {world_size}")
         print(f"PyTorch version {torch.__version__}")
+   
     dist.init_process_group("nccl", rank=rank, world_size=world_size)
     if args.mode == "pdp":
         # use fake RPC gang for local pipeline
